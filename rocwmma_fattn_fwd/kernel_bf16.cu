@@ -93,7 +93,7 @@ template <int N_WAVES>
 __device__ void mul_A_BT(
     ComputeType *__restrict__ A,
     ComputeType *__restrict__ B,
-    ComputeType *__restrict__ C,
+    ComputeType_Out *__restrict__ C,
     int lda, int ldb, int ldc,
     int m, int n, int k,
     const float scale)
@@ -157,8 +157,8 @@ __device__ void mul_add_A_B(
     ComputeType *__restrict__ A,
     ComputeType *__restrict__ B,
     ComputeType_Out *__restrict__ C,
-    int lda, int ldb, int ldc,
-    const int m, const int n, const int k)
+    int lda, int ldb, int ldc, // bc, ld_kv, d
+    const int m, const int n, const int k) // br, d, bc
 {
 
     rocwmma::fragment<matrix_a, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, ComputeType, row_major> fragA[2];
@@ -321,7 +321,7 @@ __launch_bounds__(WAVE_SIZE * N_WAVES)
     const int tx = threadIdx.x;
 
     extern __shared__ char sram[];
-    ComputeType* __restrict__ Si = reinterpret_cast<ComputeType*>(&sram[0]);       // Br * Bc
+    ComputeType_Out* __restrict__ Si = reinterpret_cast<ComputeType_Out*>(&sram[0]);       // Br * Bc
     ComputeType_Out* __restrict__ Oi = reinterpret_cast<ComputeType_Out*>(&sram[sizeof(ComputeType_Out) * Br * Bc]); // Br * d
     // ComputeType *__restrict__ Qi = &sram[Br * Bc + Br * d]; // Br * d
     // ComputeType *__restrict__ Vj = &sram[Br * Bc + Br * d]; // Bc * d
@@ -385,7 +385,8 @@ __launch_bounds__(WAVE_SIZE * N_WAVES)
                 for (int i = 0; i < Bc; i++)
                 {
                     if (i >= tx + (ele_y - ele_x + 1))
-                        Si[tx * Bc + i] = -MAX_NUM;
+                        //Si[tx * Bc + i] = -MAX_NUM;
+                        Si[tx * Bc + i] = -FLT_MAX;
                 }
             }
         }
@@ -397,14 +398,16 @@ __launch_bounds__(WAVE_SIZE * N_WAVES)
             {
 #pragma unroll 32
                 for (int i = nkv - ele_x; i < Bc; i++)
-                    Si[tx * Bc + i] = -MAX_NUM;
+                    //Si[tx * Bc + i] = -MAX_NUM;
+                    Si[tx * Bc + i] = -FLT_MAX;
             }
 
             if (unlikely((yb > nq) && (tx < Bc)))
             {
 #pragma unroll 32
                 for (int i = nq - ele_y; i < Br; i++)
-                    Si[i * Bc + tx] = -MAX_NUM;
+                    //Si[i * Bc + tx] = -MAX_NUM;
+                    Si[i * Bc + tx] = -FLT_MAX;
             }
             __syncthreads();
         }
@@ -417,10 +420,12 @@ __launch_bounds__(WAVE_SIZE * N_WAVES)
 #pragma unroll 2
             for (int i = 0; i < Bc; i += 16)
             {
-                bhalf16 val = HALF16(Si[(tx * Bc) + i]); 
+                //bhalf16 val = HALF16(Si[(tx * Bc) + i]); 
+                float_v16 val_f32 = FLOATV16(Si[(tx * Bc) + i]); 
 #pragma unroll
-                for (int j = 0; j < 16; j++)
-                    val32 = max(val32, bf16_to_f32(val[j])); // V_PK_MAX_F16
+                for (int k = 0; k < 16; k++)
+//                    val32 = max(val32, bf16_to_f32(val[j])); // V_PK_MAX_F16
+                    val32 = max(val32, val_f32[k]); // V_PK_MAX_F16
             }
             row_max_new = val32;
 
@@ -433,28 +438,29 @@ __launch_bounds__(WAVE_SIZE * N_WAVES)
 #pragma unroll 4
             for (int i = 0; i < Bc; i += 16)
             {
-                bhalf16 val = HALF16(Si[(tx * Bc) + i]);
-                float_v16 val_f32;
-#pragma unroll // Load fp16 into VGPRs and convert to FP32
-                for (int j = 0; j < 16; j++) 
-                    val_f32[j] = bf16_to_f32((val[j]));
+                //bhalf16 val = HALF16(Si[(tx * Bc) + i]);
+                float_v16 val_f32 = FLOATV16(Si[(tx * Bc) + i]);
+//#pragma unroll // Load fp16 into VGPRs and convert to FP32
+//                for (int j = 0; j < 16; j++) 
+//                    val_f32[j] = bf16_to_f32((val[j]));
 // Si - mi
                 val_f32 = val_f32 - row_max_new;
 #pragma unroll // exp but using exp2 instead.
-                for (int j = 0; j < 16; j++)
+                for (int k = 0; k < 16; k++)
                     //val_f32[j] = exp2f(val_f32[j]);
-                    val_f32[j] = expf(val_f32[j]);
+                    val_f32[k] = expf(val_f32[k]);
 
 #pragma unroll // calc rowsum
-                for (int j = 0; j < 16; j++)
-                    row_sum += val_f32[j];
+                for (int k = 0; k < 16; k++)
+                    row_sum += val_f32[k];
 
+                bhalf16 val;
 #pragma unroll
-                for (int j = 0; j < 16; j++)
-                    val[j] = f32_to_bf16(val_f32[j]);
+                for (int k = 0; k < 16; k++)
+                    val[k] = f32_to_bf16(val_f32[k]);
 
                // write back
-                HALF16(Si[(tx * Bc) + i]) = val;
+                HALF16((reinterpret_cast<ComputeType*>(Si))[(tx * Bc * 2) + i]) = val;
             }
             l_i = rowmax_diff_exp * l_i + row_sum;
 
@@ -472,17 +478,34 @@ __launch_bounds__(WAVE_SIZE * N_WAVES)
         }
         __syncthreads();
 
+
+        if (tx < Br && tx % 2 == 1)
+        {
+            for (int i = 0; i < Bc; i += 16) {
+                HALF16((reinterpret_cast<ComputeType*>(Si))[(tx * Bc) + i]) = HALF16((reinterpret_cast<ComputeType*>(Si))[(tx * Bc * 2) + i]);
+            }
+        }
+        __syncthreads();
+            
+        if (tx < Br && tx % 2 == 0)
+        {
+            for (int i = 0; i < Bc; i += 16) {
+                HALF16((reinterpret_cast<ComputeType*>(Si))[(tx * Bc) + i]) = HALF16((reinterpret_cast<ComputeType*>(Si))[(tx * Bc * 2) + i]);
+            }
+        }
+        __syncthreads();
+
         if constexpr (!pad_mask)
-            mul_add_A_B<N_WAVES>(Si, Vj, Oi,   Bc,ld_kv,d,   Br, d, Bc);
+            mul_add_A_B<N_WAVES>(reinterpret_cast<ComputeType*>(Si), Vj, Oi,   Bc,ld_kv,d,   Br, d, Bc);
         else
         {
             if (unlikely(xr > nkv))
             {
-                mul_add_A_B_mask_k<N_WAVES>(Si, Vj, Oi,   Bc,ld_kv,d,  Br, d, Bc, Bc - (xr - nkv));
+                mul_add_A_B_mask_k<N_WAVES>(reinterpret_cast<ComputeType*>(Si), Vj, Oi,   Bc,ld_kv,d,  Br, d, Bc, Bc - (xr - nkv));
             }
             else
             {
-                mul_add_A_B<N_WAVES>(Si, Vj, Oi,   Bc,ld_kv,d,    Br, d, Bc);
+                mul_add_A_B<N_WAVES>(reinterpret_cast<ComputeType*>(Si), Vj, Oi,   Bc,ld_kv,d,    Br, d, Bc);
             }
         }
 
