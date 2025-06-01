@@ -479,33 +479,33 @@ __launch_bounds__(WAVE_SIZE * N_WAVES)
         __syncthreads();
 
 
-        if (tx < Br && tx % 2 == 1)
-        {
-            for (int i = 0; i < Bc; i += 16) {
-                HALF16((reinterpret_cast<ComputeType*>(Si))[(tx * Bc) + i]) = HALF16((reinterpret_cast<ComputeType*>(Si))[(tx * Bc * 2) + i]);
-            }
-        }
-        __syncthreads();
-            
-        if (tx < Br && tx % 2 == 0)
-        {
-            for (int i = 0; i < Bc; i += 16) {
-                HALF16((reinterpret_cast<ComputeType*>(Si))[(tx * Bc) + i]) = HALF16((reinterpret_cast<ComputeType*>(Si))[(tx * Bc * 2) + i]);
-            }
-        }
-        __syncthreads();
+//        if (tx < Br && tx % 2 == 1)
+//        {
+//            for (int i = 0; i < Bc; i += 16) {
+//                HALF16((reinterpret_cast<ComputeType*>(Si))[(tx * Bc) + i]) = HALF16((reinterpret_cast<ComputeType*>(Si))[(tx * Bc * 2) + i]);
+//            }
+//        }
+//        __syncthreads();
+//            
+//        if (tx < Br && tx % 2 == 0)
+//        {
+//            for (int i = 0; i < Bc; i += 16) {
+//                HALF16((reinterpret_cast<ComputeType*>(Si))[(tx * Bc) + i]) = HALF16((reinterpret_cast<ComputeType*>(Si))[(tx * Bc * 2) + i]);
+//            }
+//        }
+//        __syncthreads();
 
         if constexpr (!pad_mask)
-            mul_add_A_B<N_WAVES>(reinterpret_cast<ComputeType*>(Si), Vj, Oi,   Bc,ld_kv,d,   Br, d, Bc);
+            mul_add_A_B<N_WAVES>(reinterpret_cast<ComputeType*>(Si), Vj, Oi,   2*Bc,ld_kv,d,   Br, d, Bc);
         else
         {
             if (unlikely(xr > nkv))
             {
-                mul_add_A_B_mask_k<N_WAVES>(reinterpret_cast<ComputeType*>(Si), Vj, Oi,   Bc,ld_kv,d,  Br, d, Bc, Bc - (xr - nkv));
+                mul_add_A_B_mask_k<N_WAVES>(reinterpret_cast<ComputeType*>(Si), Vj, Oi,   2*Bc,ld_kv,d,  Br, d, Bc, Bc - (xr - nkv));
             }
             else
             {
-                mul_add_A_B<N_WAVES>(reinterpret_cast<ComputeType*>(Si), Vj, Oi,   Bc,ld_kv,d,    Br, d, Bc);
+                mul_add_A_B<N_WAVES>(reinterpret_cast<ComputeType*>(Si), Vj, Oi,   2*Bc,ld_kv,d,    Br, d, Bc);
             }
         }
 
