@@ -18,10 +18,11 @@ import triton
 from triton_fused_attention import _attention
 
 from rocwmma_fattn.FlashAttn import FlashAttentionFunction
+from rocwmma_fattn_fwd.FlashAttn import FlashAttentionFunction2
 
 triton_fttn = _attention.apply
 
-test_round = 200
+test_round = 100
 def count_time(func):
     def wrapper(*args, **kwargs):
         # torch.cuda.empty_cache()
@@ -29,7 +30,7 @@ def count_time(func):
         
         #warm up
         torch.cuda.synchronize()
-        for _ in range(50):
+        for _ in range(10):
             ret = func(*args, **kwargs)
         torch.cuda.synchronize()
         
@@ -61,12 +62,13 @@ def count_time(func):
 #torch.Size([2, 10, 4096, 64]) torch.Size([2, 10, 77, 64]) torch.Size([2, 10, 77, 64])
 #torch.Size([2, 10, 4096, 64]) torch.Size([2, 10, 4096, 64]) torch.Size([2, 10, 4096, 64])
 
-(B, H, N, D) = (1, 24, 4096, 64)
+(B, H, N, D) = (1, 12, 1024, 128)
 causal = False
-dtype = torch.float16
+tensor_dtype = torch.bfloat16
 
 
 wmma_fttn = FlashAttentionFunction.apply
+wmma_fttn_2 = FlashAttentionFunction2.apply
 
 
 def pad_to_multiple(tensor, multiple, dim=-1, val = 0):
@@ -77,7 +79,7 @@ def pad_to_multiple(tensor, multiple, dim=-1, val = 0):
     padding_length = multiple - remainder
     padding_shape = list(tensor.shape)
     padding_shape[dim] = padding_length
-    padding_tensor = torch.zeros(padding_shape, device=tensor.device, dtype=tensor.dtype) + val
+    padding_tensor = torch.zeros(padding_shape, device=tensor.device, dtype=tensor_dtype) + val
     return torch.cat([tensor, padding_tensor], dim=dim), padding_length
 
 @count_time
@@ -86,33 +88,21 @@ def sdp_pt(q, k, v=None):
         enable_flash=False, enable_math=True, enable_mem_efficient=False
     ):
         r0 = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal)
+        r0 = r0.transpose(1, 2)
     return r0
 
 
 @count_time
-def sdp_bwd(q, k, v, O, dO):
-    if q.grad is not None:
-        q.grad.zero_()
-        k.grad.zero_()
-        v.grad.zero_()
-    O.backward(dO, retain_graph=True)
-    dQ, dK, dV = (q.grad, k.grad, v.grad)
-    return dQ, dK, dV
-
-@count_time
-def fttn_rocwmma_bwd(q, k, v, O, dO):
-    if q.grad is not None:
-        q.grad.zero_()
-        k.grad.zero_()
-        v.grad.zero_()
-    O.backward(dO, retain_graph=True)
-    dQ, dK, dV = (q.grad, k.grad, v.grad)
-    
-    return dQ, dK, dV
-
-@count_time
 def fttn_rocwmma(q, k, v=None):
     O = wmma_fttn(q,k,v, None,causal)
+    O = O.transpose(1, 2)
+    
+    return O
+
+@count_time
+def fttn_rocwmma_2(q, k, v=None):
+    O = wmma_fttn_2(q,k,v, None,causal)
+    O = O.transpose(1, 2)
     
     return O
 
@@ -127,27 +117,13 @@ def fttn_ck(q, k, v=None):
     del q,k,v
     #ret =  ck_fttn_pyb.fwd(q2,k2,v2, None, 0, sc, causal, False, None) # BNHD
     ret = flash_attn_func(q2,k2,v2,0,sc,causal,False)
+    #ret = flash_attn_func(q2,k2,v2,0,sc,causal,(-1,-1))
     #O = (ret[0])[:, :, :, :d_qkv]
     O = ret
-    O = O.transpose(1, 2)
+    #O = O.transpose(1, 2)
     
     #L = ret[1]
     return O 
-
-@count_time
-def ftt_triton_bwd(q, k, v, O, dO, L):
-    
-    #dQ, dK, dV = flash_attn_wmma.backward(q, k, v, O, dO, L,256,64, causal)
-
-    if q.grad is not None:
-        q.grad.zero_()
-        k.grad.zero_()
-        v.grad.zero_()
-    O.backward(dO, retain_graph=True)
-    dQ, dK, dV = (q.grad, k.grad, v.grad)
-    
-    return dQ, dK, dV
-    
 
 @count_time
 def ftt_triton(q, k, v=None):
@@ -187,8 +163,9 @@ def ftt_triton(q, k, v=None):
     sc = d_qkv ** -0.5
     
     
-    ret = triton_fttn(q, k, v, causal, sc)
-    O = ret[:, :, :, :d_qkv]
+    O = triton_fttn(q, k, v, causal, sc)
+    O = O.transpose(1, 2)
+    #O = ret[:, :, :, :d_qkv]
     #L = None
     return O #, L
 
@@ -198,23 +175,26 @@ torch.cuda.reset_peak_memory_stats()
 n_list = []
 flops_ft_list = []
 maxmem_ft_list = []
+flops_ft_2_list = []
+maxmem_ft_2_list = []
 flops_sdp_list = []
 maxmem_sdp_list = []
 flops_triton_list = []
 maxmem_triton_list = []
 flops_ck_list = []
 maxmem_ck_list = []
-for i in range(1,20,1):
-    N = 256 * i
+for i in range(0,6,1):
+    N = 4096 + 4096 * i
     q_shape = (B, H, N, D)
     v_shape = (B, H, N, D)
     k_shape = (B, H, N, D)
     print(f'B:{B}, H:{H}, SeqLen:{N}, DimHead:{D}')
-    q = torch.rand(q_shape, dtype=dtype, device="cuda")  # * 5
-    k = torch.rand(k_shape, dtype=dtype, device="cuda")  # * 80
-    v = torch.rand(v_shape, dtype=dtype, device="cuda")  # * 30
+    q = torch.rand(q_shape, dtype=tensor_dtype, device="cuda")  # * 5
+    k = torch.rand(k_shape, dtype=tensor_dtype, device="cuda")  # * 80
+    v = torch.rand(v_shape, dtype=tensor_dtype, device="cuda")  # * 30
     
     r3, flops_ft, max_memory_ft, _ = fttn_rocwmma(q, k, v)
+    r2, flops_ft_2, max_memory_ft_2, _ = fttn_rocwmma_2(q, k, v)
     r0, flops_sdp, max_memory_sdp, _ = sdp_pt(q, k, v)
     r1, flops_triton, max_memory_triton, _ = ftt_triton(q, k, v)
     r4, flops_ck, max_memory_ck, _ = fttn_ck(q,k,v)
@@ -222,13 +202,16 @@ for i in range(1,20,1):
     # L_roc = r3[1]
     # L_ck = r4[1] 
      
-    r3 = r3[0].cpu()
+    r3 = r3.cpu()
+    r2 = r2.cpu()
     r0 = r0.cpu()
     r1 = r1.cpu()
     r4 = r4.cpu()
 
     maxdiff = (r0 - r3).abs().max().item()
     print("max diff sdp-rocwmma: ", maxdiff)
+    maxdiff = (r0 - r2).abs().max().item()
+    print("max diff sdp-rocwmma_fixed: ", maxdiff)
     maxdiff = (r0 - r1).abs().max().item()
     print("max diff sdp-triton: ", maxdiff)
     maxdiff = (r0 - r4).abs().max().item()
@@ -240,20 +223,23 @@ for i in range(1,20,1):
     
     n_list.append(N)
     flops_ft_list.append(flops_ft / 1e12)
+    flops_ft_2_list.append(flops_ft_2 / 1e12)
     flops_sdp_list.append(flops_sdp / 1e12)
     flops_triton_list.append(flops_triton / 1e12)
     flops_ck_list.append(flops_ck / 1e12)
     maxmem_ft_list.append(max_memory_ft)
+    maxmem_ft_2_list.append(max_memory_ft_2)
     maxmem_sdp_list.append(max_memory_sdp)
     maxmem_triton_list.append(max_memory_triton)
     maxmem_ck_list.append(max_memory_ck)
 
-fig = plt.figure(figsize=[7,9])
+fig = plt.figure(figsize=[12,16])
 plt.subplot(211)
-plt.plot(n_list, flops_ft_list, label="Flash attn 2 (rocwmma)")
-plt.plot(n_list, flops_sdp_list, label="PyTorch SDPA")
-plt.plot(n_list, flops_triton_list, label="Flash attn 2 (Triton)")
-plt.plot(n_list, flops_ck_list, label="Flash attn 2 (ck)")
+plt.plot(n_list, flops_ft_list, label="rocwmma")
+plt.plot(n_list, flops_ft_2_list, label="rocwmma-fixed")
+plt.plot(n_list, flops_sdp_list, label="SDPA")
+plt.plot(n_list, flops_triton_list, label="triton")
+plt.plot(n_list, flops_ck_list, label="flash-attn-ck")
 plt.xlabel("Seqlen")
 plt.ylabel('TFlops')
 plt.legend()
@@ -261,10 +247,11 @@ plt.xticks(n_list)
 plt.grid(True)
 
 plt.subplot(212)
-plt.plot(n_list, maxmem_ft_list, label="Flash attn 2 (rocwmma)")
-plt.plot(n_list, maxmem_sdp_list, label="PyTorch SDPA")
-plt.plot(n_list, maxmem_triton_list, label="Flash attn 2 (Triton)")
-plt.plot(n_list, maxmem_ck_list, label="Flash attn 2 (ck)")
+plt.plot(n_list, maxmem_ft_list, label="rocwmma")
+plt.plot(n_list, maxmem_ft_2_list, label="rocwmma-fixed")
+plt.plot(n_list, maxmem_sdp_list, label="SDPA")
+plt.plot(n_list, maxmem_triton_list, label="triton")
+plt.plot(n_list, maxmem_ck_list, label="flash-attn-ck")
 plt.xlabel("Seqlen")
 plt.ylabel('VRAM(MB)')
 plt.legend()
@@ -272,10 +259,16 @@ plt.xticks(n_list)
 plt.suptitle(f"Forward B:{B}, H:{H}, D:{D} (BHND Order)")
 plt.grid(True)
 fig.subplots_adjust(top=0.95,bottom=0.05,right=0.96)
-fig.savefig('fwd_scan_N.png')
+fig.savefig('fwd_scan_N_all.png')
 
 
 plt.show()
+
+print(r0.cpu()[0, 0, :, :])
+print(r1.cpu()[0, 0, :, :])
+print(r2.cpu()[0, 0, :, :])
+print(r3.cpu()[0, 0, :, :])
+
 exit()
 
 torch.cuda.empty_cache()
@@ -298,9 +291,9 @@ for i in range(48,256+16,16):
     v_shape = (B, H, N, D)
     k_shape = (B, H, N, D)
     print(f'B:{B}, H:{H}, SeqLen:{N}, DimHead:{D}')
-    q = torch.rand(q_shape, dtype=dtype, device="cuda")  # * 5
-    k = torch.rand(k_shape, dtype=dtype, device="cuda")  # * 80
-    v = torch.rand(v_shape, dtype=dtype, device="cuda")  # * 30
+    q = torch.rand(q_shape, dtype=tensor_dtype, device="cuda")  # * 5
+    k = torch.rand(k_shape, dtype=tensor_dtype, device="cuda")  # * 80
+    v = torch.rand(v_shape, dtype=tensor_dtype, device="cuda")  # * 30
 
 
     r3, flops_ft, max_memory_ft, _ = fttn_rocwmma(q, k, v)
