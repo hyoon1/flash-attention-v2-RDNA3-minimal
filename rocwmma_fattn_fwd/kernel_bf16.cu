@@ -51,15 +51,36 @@ constexpr int WAVE_SIZE = 32;
 
 typedef uint16_t bf16_frag __attribute__((ext_vector_type(16)));
 typedef float fp32_frag __attribute__((ext_vector_type(8)));
+typedef uint16_t bhalf4 __attribute__((ext_vector_type(4)));
 typedef uint16_t bhalf8 __attribute__((ext_vector_type(8)));
 typedef uint16_t bhalf16 __attribute__((ext_vector_type(16)));
 #define HALF16(pointer) (reinterpret_cast<bhalf16 *>((void *)&(pointer))[0])
 #define HALF8(pointer) (reinterpret_cast<bhalf8 *>((void *)&(pointer))[0])
 typedef float float8 __attribute__((ext_vector_type(8)));
+typedef float float_v4 __attribute__((ext_vector_type(4)));
 typedef float float_v16 __attribute__((ext_vector_type(16)));
 #define FLOAT8(pointer) (reinterpret_cast<float8 *>((void *)&(pointer))[0])
 #define FLOATV16(pointer) (reinterpret_cast<float_v16 *>((void *)&(pointer))[0])
 #define FLOAT4(pointer) (reinterpret_cast<float4 *>(&(pointer))[0])
+
+__device__ __forceinline__ bhalf4 f32_to_bf16_4(const float_v4& val)
+{
+    bhalf4 ret;
+
+    for (int i = 0; i < 4; i++) {
+        union fcvt {
+            uint32_t u32;
+            float f32;
+        } u;
+
+        u.f32 = val[i];
+        u.u32 += 0x7fff + ((u.u32 >> 16) & 1);  // BF16 RNE with no nan/inf check
+        ret[i] = uint16_t(u.u32 >> 16);
+    }
+
+    return ret;
+}
+
 
 __device__ __forceinline__ uint16_t f32_to_bf16(float val)
 {
@@ -94,8 +115,8 @@ __device__ void mul_A_BT(
     ComputeType *__restrict__ A,
     ComputeType *__restrict__ B,
     ComputeType_Out *__restrict__ C,
-    int lda, int ldb, int ldc,
-    int m, int n, int k,
+    int lda, int ldb, int ldc, // ldq, ld_kv, bc
+    int m, int n, int k, // br, bc d
     const float scale)
 {
 
@@ -109,10 +130,10 @@ __device__ void mul_A_BT(
 
     for (int wave_off = 0; wave_off < ((m * n) / (ROCWMMA_M * ROCWMMA_N) + N_WAVES - 1) / N_WAVES; wave_off++)
     {
-        int wave_xy = __builtin_amdgcn_readfirstlane(wave_id + wave_off * N_WAVES);
+        int wave_xy = __builtin_amdgcn_readfirstlane(wave_id + wave_off * N_WAVES); // N_WAVES=16
 
-        int wave_x = __builtin_amdgcn_readfirstlane(wave_xy % (n / ROCWMMA_N));
-        int wave_y = __builtin_amdgcn_readfirstlane(wave_xy / (n / ROCWMMA_N));
+        int wave_x = __builtin_amdgcn_readfirstlane(wave_xy % (n / ROCWMMA_N)); // wave_xy & (128/16)
+        int wave_y = __builtin_amdgcn_readfirstlane(wave_xy / (n / ROCWMMA_N)); // wave_xy % (128/16)
 
         int blk_x = __builtin_amdgcn_readfirstlane(wave_x * ROCWMMA_N);
         int blk_y = __builtin_amdgcn_readfirstlane(wave_y * ROCWMMA_M);
@@ -126,8 +147,8 @@ __device__ void mul_A_BT(
                 fragA[0] = HALF16((A + (blk_y * lda + i))[wmma_lane * lda]); // k
                 fragB[0] = HALF16((B + (blk_x * ldb + i))[wmma_lane * ldb]); // k
 
-                fragA[1] = HALF16((A + (blk_y * lda + i + ROCWMMA_K))[wmma_lane * lda]);
                 fragB[1] = HALF16((B + (blk_x * ldb + i + ROCWMMA_K))[wmma_lane * ldb]);
+                fragA[1] = HALF16((A + (blk_y * lda + i + ROCWMMA_K))[wmma_lane * lda]);
                 // fragA[2] = HALF16((A + (blk_y * k + i + 2*ROCWMMA_K))[wmma_lane * k]);
                 // fragB[2] = HALF16((B + (blk_x * k + i + 2*ROCWMMA_K))[wmma_lane * k]);
                 // fragA[3] = HALF16((A + (blk_y * k + i + 3*ROCWMMA_K))[wmma_lane * k]);
@@ -179,14 +200,15 @@ __device__ void mul_add_A_B(
         int blk_y = __builtin_amdgcn_readfirstlane(wave_y * ROCWMMA_M);
         if ((blk_x < n) && (blk_y < m))
         {
+            rocwmma::load_matrix_sync(fragC, C + (blk_y * ldc + blk_x), ldc, rocwmma::mem_row_major); //n
             rocwmma::fill_fragment(fragACC, (float32_t)0.0);
             for (int i = 0; i < k; i += ROCWMMA_K * 2)
             {
                 rocwmma::load_matrix_sync(fragA[0], A + (blk_y * lda + i), lda); //k
                 rocwmma::load_matrix_sync(fragB[0], B + (i * ldb + blk_x), ldb); //n
                 
-                rocwmma::load_matrix_sync(fragA[1], A + (blk_y * lda + (i + 1 * ROCWMMA_K)), lda);
                 rocwmma::load_matrix_sync(fragB[1], B + ((i + 1 * ROCWMMA_K) * ldb + blk_x), ldb);
+                rocwmma::load_matrix_sync(fragA[1], A + (blk_y * lda + (i + 1 * ROCWMMA_K)), lda);
                 // rocwmma::load_matrix_sync(fragA[2], A + (blk_y * k + (i + 2 * ROCWMMA_K)), k);
                 // rocwmma::load_matrix_sync(fragB[2], B + ((i + 2 * ROCWMMA_K) * n + blk_x), n);
                 // rocwmma::load_matrix_sync(fragA[3], A + (blk_y * k + (i + 3 * ROCWMMA_K)), k);
@@ -197,7 +219,6 @@ __device__ void mul_add_A_B(
                 // rocwmma::mma_sync(fragACC, fragA[2], fragB[2], fragACC);
                 // rocwmma::mma_sync(fragACC, fragA[3], fragB[3], fragACC);
             }
-            rocwmma::load_matrix_sync(fragC, C + (blk_y * ldc + blk_x), ldc, rocwmma::mem_row_major); //n
             for (int i = 0; i < fragC.num_elements; ++i)
             {
                 fragC.x[i] = fragACC.x[i] + fragC.x[i];
@@ -240,18 +261,19 @@ __device__ void mul_add_A_B_mask_k(
 
         if ((blk_x < n) && (blk_y < m))
         {
+            rocwmma::load_matrix_sync(fragC, C + (blk_y * ldc + blk_x), ldc, rocwmma::mem_row_major); //n
             rocwmma::fill_fragment(fragACC, (float32_t)0.0);
             for (int i = 0; i < wmma_k_end; i += ROCWMMA_K * 2)
             {
                 rocwmma::load_matrix_sync(fragA[0], A + (blk_y * lda + i), lda); //k
+                rocwmma::load_matrix_sync(fragB[1], B + ((i + 1 * ROCWMMA_K) * ldb + blk_x), ldb);
+
                 rocwmma::load_matrix_sync(fragB[0], B + (i * ldb + blk_x), ldb);  //n
                 rocwmma::load_matrix_sync(fragA[1], A + (blk_y * lda + (i + 1 * ROCWMMA_K)), lda);
-                rocwmma::load_matrix_sync(fragB[1], B + ((i + 1 * ROCWMMA_K) * ldb + blk_x), ldb);
 
                 rocwmma::mma_sync(fragACC, fragA[0], fragB[0], fragACC);
                 rocwmma::mma_sync(fragACC, fragA[1], fragB[1], fragACC);
             }
-            rocwmma::load_matrix_sync(fragC, C + (blk_y * ldc + blk_x), ldc, rocwmma::mem_row_major); //n
             for (int i = 0; i < fragC.num_elements; ++i)
             {
                 fragC.x[i] = fragACC.x[i] + fragC.x[i];
@@ -458,6 +480,12 @@ __launch_bounds__(WAVE_SIZE * N_WAVES)
 #pragma unroll
                 for (int k = 0; k < 16; k++)
                     val[k] = f32_to_bf16(val_f32[k]);
+//                bhalf4* val_ptr = reinterpret_cast<bhalf4*>(&val);
+//
+//                const float* val_f32_raw = reinterpret_cast<const float*>(&val_f32);
+//#pragma unroll
+//                for (int k = 0; k < 4; k++)
+//                    val_ptr[k] = f32_to_bf16_4(*reinterpret_cast<const float_v4*>(&val_f32_raw[k * 4]));
 
                // write back
                 HALF16((reinterpret_cast<ComputeType*>(Si))[(tx * Bc * 2) + i]) = val;
@@ -528,9 +556,16 @@ __launch_bounds__(WAVE_SIZE * N_WAVES)
 
                 bhalf16 val;
 #pragma unroll
-                for (int j = 0; j < 16; j++)
-                    val[j] = f32_to_bf16(val_f32[j]);
-                    
+                for (int k = 0; k < 16; k++)
+                    val[k] = f32_to_bf16(val_f32[k]);
+
+//                bhalf4* val_ptr = reinterpret_cast<bhalf4*>(&val);
+//
+//                const float* val_f32_raw = reinterpret_cast<const float*>(&val_f32);
+//#pragma unroll
+//                for (int k = 0; k < 4; k++)
+//                    val_ptr[k] = f32_to_bf16_4(*reinterpret_cast<const float_v4*>(&val_f32_raw[k * 4]));
+
                 //HALF8(Oi[(tx * d) + i]) = val;
                 HALF16((&(o[q_offset + (Tr_i * Br) * ld_q]))[tx * ld_q + i]) = val;
             }
