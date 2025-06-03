@@ -119,14 +119,12 @@ __device__ void mul_A_BT(
     int m, int n, int k, // br, bc d
     const float scale)
 {
-
     bf16_frag fragA[2];
     bf16_frag fragB[2];
 
     const int wave_id = __builtin_amdgcn_readfirstlane(threadIdx.x / WAVE_SIZE);
     const int lane_id = threadIdx.x % WAVE_SIZE;
     const int wmma_lane = (threadIdx.x % 16);
-
 
     for (int wave_off = 0; wave_off < ((m * n) / (ROCWMMA_M * ROCWMMA_N) + N_WAVES - 1) / N_WAVES; wave_off++)
     {
@@ -140,15 +138,13 @@ __device__ void mul_A_BT(
         if ((blk_x < n) && (blk_y < m))
         {
             fp32_frag fragACC = {};
-
             for (int i = 0; i < k; i += ROCWMMA_K * 2)
             {
-
                 fragA[0] = HALF16((A + (blk_y * lda + i))[wmma_lane * lda]); // k
                 fragB[0] = HALF16((B + (blk_x * ldb + i))[wmma_lane * ldb]); // k
 
-                fragB[1] = HALF16((B + (blk_x * ldb + i + ROCWMMA_K))[wmma_lane * ldb]);
                 fragA[1] = HALF16((A + (blk_y * lda + i + ROCWMMA_K))[wmma_lane * lda]);
+                fragB[1] = HALF16((B + (blk_x * ldb + i + ROCWMMA_K))[wmma_lane * ldb]);
                 // fragA[2] = HALF16((A + (blk_y * k + i + 2*ROCWMMA_K))[wmma_lane * k]);
                 // fragB[2] = HALF16((B + (blk_x * k + i + 2*ROCWMMA_K))[wmma_lane * k]);
                 // fragA[3] = HALF16((A + (blk_y * k + i + 3*ROCWMMA_K))[wmma_lane * k]);
@@ -159,13 +155,12 @@ __device__ void mul_A_BT(
                 // fragACC = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(fragA[2], fragB[2], fragACC);
                 // fragACC = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(fragA[3], fragB[3], fragACC);
             }
-            fragACC = fragACC * scale;
+            //fragACC = fragACC * scale;
             __syncthreads();
-
             for (int ele = 0; ele < 8; ++ele)
             {
                 const int r = ele * 2 + (lane_id / 16);
-                (C + (blk_y * ldc + blk_x))[r * ldc + wmma_lane] = fragACC[ele]; // n
+                (C + (blk_y * ldc + blk_x))[r * ldc + wmma_lane] = fragACC[ele] * scale; // n
             }
         }
     }
@@ -178,7 +173,7 @@ __device__ void mul_add_A_B(
     ComputeType *__restrict__ A,
     ComputeType *__restrict__ B,
     ComputeType_Out *__restrict__ C,
-    int lda, int ldb, int ldc, // bc, ld_kv, d
+    int lda, int ldb, int ldc, // 2*bc, ld_kv, d
     const int m, const int n, const int k) // br, d, bc
 {
 
@@ -188,6 +183,8 @@ __device__ void mul_add_A_B(
     rocwmma::fragment<accumulator, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, float32_t> fragACC;
 
     const int wave_id = __builtin_amdgcn_readfirstlane(threadIdx.x / WAVE_SIZE);
+    //const int lane_id = threadIdx.x % WAVE_SIZE;
+    //const int wmma_lane = (threadIdx.x % 16);
 
     for (int wave_off = 0; wave_off < ((m * n) / (ROCWMMA_M * ROCWMMA_N) + N_WAVES - 1) / N_WAVES; wave_off++)
     {
@@ -206,9 +203,8 @@ __device__ void mul_add_A_B(
             {
                 rocwmma::load_matrix_sync(fragA[0], A + (blk_y * lda + i), lda); //k
                 rocwmma::load_matrix_sync(fragB[0], B + (i * ldb + blk_x), ldb); //n
-                
-                rocwmma::load_matrix_sync(fragB[1], B + ((i + 1 * ROCWMMA_K) * ldb + blk_x), ldb);
                 rocwmma::load_matrix_sync(fragA[1], A + (blk_y * lda + (i + 1 * ROCWMMA_K)), lda);
+                rocwmma::load_matrix_sync(fragB[1], B + ((i + 1 * ROCWMMA_K) * ldb + blk_x), ldb);
                 // rocwmma::load_matrix_sync(fragA[2], A + (blk_y * k + (i + 2 * ROCWMMA_K)), k);
                 // rocwmma::load_matrix_sync(fragB[2], B + ((i + 2 * ROCWMMA_K) * n + blk_x), n);
                 // rocwmma::load_matrix_sync(fragA[3], A + (blk_y * k + (i + 3 * ROCWMMA_K)), k);
@@ -219,6 +215,7 @@ __device__ void mul_add_A_B(
                 // rocwmma::mma_sync(fragACC, fragA[2], fragB[2], fragACC);
                 // rocwmma::mma_sync(fragACC, fragA[3], fragB[3], fragACC);
             }
+
             for (int i = 0; i < fragC.num_elements; ++i)
             {
                 fragC.x[i] = fragACC.x[i] + fragC.x[i];
@@ -268,8 +265,8 @@ __device__ void mul_add_A_B_mask_k(
                 rocwmma::load_matrix_sync(fragA[0], A + (blk_y * lda + i), lda); //k
                 rocwmma::load_matrix_sync(fragB[1], B + ((i + 1 * ROCWMMA_K) * ldb + blk_x), ldb);
 
-                rocwmma::load_matrix_sync(fragB[0], B + (i * ldb + blk_x), ldb);  //n
                 rocwmma::load_matrix_sync(fragA[1], A + (blk_y * lda + (i + 1 * ROCWMMA_K)), lda);
+                rocwmma::load_matrix_sync(fragB[0], B + (i * ldb + blk_x), ldb);  //n
 
                 rocwmma::mma_sync(fragACC, fragA[0], fragB[0], fragACC);
                 rocwmma::mma_sync(fragACC, fragA[1], fragB[1], fragACC);
@@ -381,7 +378,6 @@ __launch_bounds__(WAVE_SIZE * N_WAVES)
 
     for (int j = 0; j < Tc; j++)
     {
-
         ComputeType *__restrict__ Kj = &k[kv_offset + (j * Bc) * ld_kv];
         ComputeType *__restrict__ Vj = &v[kv_offset + (j * Bc) * ld_kv];
         int ele_x = j * Bc;
@@ -407,7 +403,6 @@ __launch_bounds__(WAVE_SIZE * N_WAVES)
                 for (int i = 0; i < Bc; i++)
                 {
                     if (i >= tx + (ele_y - ele_x + 1))
-                        //Si[tx * Bc + i] = -MAX_NUM;
                         Si[tx * Bc + i] = -FLT_MAX;
                 }
             }
@@ -420,7 +415,6 @@ __launch_bounds__(WAVE_SIZE * N_WAVES)
             {
 #pragma unroll 32
                 for (int i = nkv - ele_x; i < Bc; i++)
-                    //Si[tx * Bc + i] = -MAX_NUM;
                     Si[tx * Bc + i] = -FLT_MAX;
             }
 
@@ -428,7 +422,6 @@ __launch_bounds__(WAVE_SIZE * N_WAVES)
             {
 #pragma unroll 32
                 for (int i = nq - ele_y; i < Br; i++)
-                    //Si[i * Bc + tx] = -MAX_NUM;
                     Si[i * Bc + tx] = -FLT_MAX;
             }
             __syncthreads();
@@ -442,11 +435,9 @@ __launch_bounds__(WAVE_SIZE * N_WAVES)
 #pragma unroll 2
             for (int i = 0; i < Bc; i += 16)
             {
-                //bhalf16 val = HALF16(Si[(tx * Bc) + i]); 
                 float_v16 val_f32 = FLOATV16(Si[(tx * Bc) + i]); 
 #pragma unroll
                 for (int k = 0; k < 16; k++)
-//                    val32 = max(val32, bf16_to_f32(val[j])); // V_PK_MAX_F16
                     val32 = max(val32, val_f32[k]); // V_PK_MAX_F16
             }
             row_max_new = val32;
@@ -460,17 +451,14 @@ __launch_bounds__(WAVE_SIZE * N_WAVES)
 #pragma unroll 4
             for (int i = 0; i < Bc; i += 16)
             {
-                //bhalf16 val = HALF16(Si[(tx * Bc) + i]);
                 float_v16 val_f32 = FLOATV16(Si[(tx * Bc) + i]);
-//#pragma unroll // Load fp16 into VGPRs and convert to FP32
-//                for (int j = 0; j < 16; j++) 
-//                    val_f32[j] = bf16_to_f32((val[j]));
 // Si - mi
                 val_f32 = val_f32 - row_max_new;
 #pragma unroll // exp but using exp2 instead.
-                for (int k = 0; k < 16; k++)
+                for (int k = 0; k < 16; k++) {
                     //val_f32[j] = exp2f(val_f32[j]);
                     val_f32[k] = expf(val_f32[k]);
+                }
 
 #pragma unroll // calc rowsum
                 for (int k = 0; k < 16; k++)
@@ -671,8 +659,8 @@ std::vector<torch::Tensor> forward_bf16(
     auto L = torch::zeros({b, h, n + Nq_pad_sz}, opt2);
 
     int N_WAVES = 16;
-    // if(d + d_pad_sz == 128)
-    //     N_WAVES = 32;
+    if(d + d_pad_sz == 128)
+         N_WAVES = 32;
 
     auto blockDim = dim3(WAVE_SIZE * N_WAVES); // 32 * 16 = 512
     int nblk = b * h * Tr;
@@ -703,19 +691,19 @@ std::vector<torch::Tensor> forward_bf16(
 
     cudaError_t err = cudaGetLastError();
 
-    // if(N_WAVES == 32)
-    // {
-    //     constexpr int NW = 32;
-    //     if (!pad_mask && !causal)
-    //         fwd_kernel<false, false,NW><<<gridDim, blockDim, sram_sz>>>(para_fwd);
-    //     else if (pad_mask && causal)
-    //         fwd_kernel<true, true,NW><<<gridDim, blockDim, sram_sz>>>(para_fwd);
-    //     else if (!pad_mask && causal)
-    //         fwd_kernel<false, true,NW><<<gridDim, blockDim, sram_sz>>>(para_fwd);
-    //     else if (pad_mask && !causal)
-    //         fwd_kernel<true, false,NW><<<gridDim, blockDim, sram_sz>>>(para_fwd);
-    // }else 
-    if(N_WAVES == 16)
+    if (N_WAVES == 32)
+    {
+        constexpr int NW = 32;
+        if (!pad_mask && !causal)
+            fwd_kernel<false, false,NW><<<gridDim, blockDim, sram_sz>>>(para_fwd);
+        else if (pad_mask && causal)
+            fwd_kernel<true, true,NW><<<gridDim, blockDim, sram_sz>>>(para_fwd);
+        else if (!pad_mask && causal)
+            fwd_kernel<false, true,NW><<<gridDim, blockDim, sram_sz>>>(para_fwd);
+        else if (pad_mask && !causal)
+            fwd_kernel<true, false,NW><<<gridDim, blockDim, sram_sz>>>(para_fwd);
+    }
+    else if (N_WAVES == 16)
     {
         constexpr int NW = 16;
         if (!pad_mask && !causal)
