@@ -88,21 +88,21 @@ def sdp_pt(q, k, v=None):
         enable_flash=False, enable_math=True, enable_mem_efficient=False
     ):
         r0 = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal)
-        r0 = r0.transpose(1, 2)
+        r0 = r0.transpose(1, 2).contiguous()
     return r0
 
 
 @count_time
 def fttn_rocwmma(q, k, v=None):
     O = wmma_fttn(q,k,v, None,causal)
-    O = O.transpose(1, 2)
+    O = O.transpose(1, 2).contiguous()
     
     return O
 
 @count_time
 def fttn_rocwmma_2(q, k, v=None):
     O = wmma_fttn_2(q,k,v, None,causal)
-    O = O.transpose(1, 2)
+    O = O.transpose(1, 2).contiguous()
     
     return O
 

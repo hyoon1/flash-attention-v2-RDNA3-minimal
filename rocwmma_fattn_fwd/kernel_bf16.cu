@@ -86,7 +86,7 @@ typedef bhalf16 bf16_frag;
 //typedef float float_v16 __attribute__((ext_vector_type(16)));
 #define FLOAT8(pointer) (reinterpret_cast<float8 *>((void *)&(pointer))[0])
 #define FLOATV16(pointer) (reinterpret_cast<float_v16 *>((void *)&(pointer))[0])
-#define FLOAT4(pointer) (reinterpret_cast<float4 *>(&(pointer))[0])
+#define FLOAT4(pointer) (reinterpret_cast<float_v4 *>(&(pointer))[0])
 
 __device__ __forceinline__ bhalf4 f32_to_bf16_4(const float_v4& val)
 {
@@ -122,7 +122,9 @@ __device__ __forceinline__ uint16_t f32_to_bf16(float val)
     return res;
 }
 
-__device__ __forceinline__ bhalf8 f32_to_bf16_8(const float8& inp) {
+
+__device__ __forceinline__ bhalf8 f32_to_bf16_8(const float8& inp)
+{
     bhalf8 ret;
     for (int i = 0; i < 8; i++) {
         union fcvt {
@@ -161,6 +163,17 @@ __device__ __forceinline__ float bf16_to_f32(uint16_t val)
     return u.val_f32;
 }
 
+__device__ __forceinline__ float to_float_b16(const bit16_t& inp)
+{
+    union tmpcvt {
+      bit16_t u;
+      _Float16 f;
+      __hip_bfloat16 b;
+    } t16;
+    t16.u = inp;
+    return __bfloat162float(t16.b);
+}
+
 //================================ Matrix multiplication ===============================
 // C = A @ (B^T)
 template <int N_WAVES>
@@ -177,6 +190,7 @@ __device__ void mul_A_BT(
 
     const int wave_id = __builtin_amdgcn_readfirstlane(threadIdx.x / WAVE_SIZE);
     const int lane_id = threadIdx.x % WAVE_SIZE;
+    const int row_id = lane_id / 16;
     const int wmma_lane = (threadIdx.x % 16);
 
     for (int wave_off = 0; wave_off < ((m * n) / (ROCWMMA_M * ROCWMMA_N) + N_WAVES - 1) / N_WAVES; wave_off++)
@@ -210,9 +224,10 @@ __device__ void mul_A_BT(
             }
             //fragACC = fragACC * scale;
             __syncthreads();
+
             for (int ele = 0; ele < 8; ++ele)
             {
-                const int r = ele * 2 + (lane_id / 16);
+                const int r = ele * 2 + row_id;
                 (C + (blk_y * ldc + blk_x))[r * ldc + wmma_lane] = fragACC[ele] * scale; // n
             }
         }
@@ -233,11 +248,8 @@ __device__ void mul_add_A_B(
     rocwmma::fragment<matrix_a, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, ComputeType, row_major> fragA[2];
     rocwmma::fragment<matrix_b, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, ComputeType, row_major> fragB[2];
     rocwmma::fragment<accumulator, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, ComputeType_Out> fragC;
-    //rocwmma::fragment<accumulator, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, float32_t> fragACC;
 
     const int wave_id = __builtin_amdgcn_readfirstlane(threadIdx.x / WAVE_SIZE);
-    //const int lane_id = threadIdx.x % WAVE_SIZE;
-    //const int wmma_lane = (threadIdx.x % 16);
 
     for (int wave_off = 0; wave_off < ((m * n) / (ROCWMMA_M * ROCWMMA_N) + N_WAVES - 1) / N_WAVES; wave_off++)
     {
@@ -251,7 +263,6 @@ __device__ void mul_add_A_B(
         if ((blk_x < n) && (blk_y < m))
         {
             rocwmma::load_matrix_sync(fragC, C + (blk_y * ldc + blk_x), ldc, rocwmma::mem_row_major); //n
-            //rocwmma::fill_fragment(fragACC, (float32_t)0.0);
             for (int i = 0; i < k; i += ROCWMMA_K * 2)
             {
                 rocwmma::load_matrix_sync(fragA[0], A + (blk_y * lda + i), lda); //k
@@ -268,7 +279,6 @@ __device__ void mul_add_A_B(
                 // rocwmma::mma_sync(fragACC, fragA[2], fragB[2], fragACC);
                 // rocwmma::mma_sync(fragACC, fragA[3], fragB[3], fragACC);
             }
-
             //for (int i = 0; i < fragC.num_elements; ++i)
             //{
             //    fragC.x[i] = fragACC.x[i] + fragC.x[i];
@@ -394,14 +404,6 @@ __launch_bounds__(WAVE_SIZE * N_WAVES)
 
     extern __shared__ char sram[];
 
-//    uintptr_t raw_base = reinterpret_cast<uintptr_t>(sram);
-//    uintptr_t aligned_base = (raw_base + 63) & ~uintptr_t(63);
-//    uintptr_t offset_Si = 0;
-//    uintptr_t offset_Oi = offset_Si + sizeof(ComputeType_Out) * Br * Bc;
-
-//    ComputeType_Out* __restrict__ Si = reinterpret_cast<ComputeType_Out*>(aligned_base + offset_Si);       // Br * Bc
-//    ComputeType_Out* __restrict__ Oi = reinterpret_cast<ComputeType_Out*>(aligned_base + offset_Oi); // Br * d
-//    float_v16* Oi_vec = reinterpret_cast<float_v16*>(Oi);
     ComputeType_Out* __restrict__ Si = reinterpret_cast<ComputeType_Out*>(&sram[0]);       // Br * Bc
     ComputeType_Out* __restrict__ Oi = reinterpret_cast<ComputeType_Out*>(&sram[sizeof(ComputeType_Out) * Br * Bc]); // Br * d
     // ComputeType *__restrict__ Qi = &sram[Br * Bc + Br * d]; // Br * d
@@ -431,23 +433,18 @@ __launch_bounds__(WAVE_SIZE * N_WAVES)
         //     FLOAT8(Si[tx * d + i]) = {0, 0, 0, 0, 0, 0, 0, 0};
         // }
     }
-//    const int chunk_size_Oi = 8;
-//    int num_th_row_Oi = d / chunk_size_Oi; // 128 / 8 = 16
-//    int Oi_row = tx / num_th_row_Oi;
-//    int Oi_col = (tx % num_th_row_Oi) * chunk_size_Oi;
-//    int Oi_idx = Oi_row * d + Oi_col;
-//
-//    if (tx < num_th_row_Oi * Br)
-//    {
-//        FLOAT8(Oi[Oi_idx]) = {0, 0, 0, 0, 0, 0, 0, 0};
-//    }
-//    __syncthreads();
 
     ComputeType *__restrict__ Qi = &q[q_offset + (Tr_i * Br) * ld_q];
     // ComputeType *__restrict__ Oi = &o[q_offset + Tr_i * Br * d];
 
     float row_max_old = -FLT_MAX;
     float l_i = 0;
+
+    const int chunk_size_Si = 8;
+    int num_th_row_Si = Bc / chunk_size_Si; // 128 / 8 = 16
+    int qk_row = tx / num_th_row_Si;
+    int qk_col = (tx % num_th_row_Si) * chunk_size_Si;
+    int qk_idx = qk_row * Bc + qk_col;
 
     for (int j = 0; j < Tc; j++)
     {
@@ -501,239 +498,89 @@ __launch_bounds__(WAVE_SIZE * N_WAVES)
         }
         //------------
 
-        float val32 = row_max_new;
-        const int chunk_size_Si = 8;
-        int num_th_row_Si = Bc / chunk_size_Si; // 128 / 8 = 16
-        int qk_row = tx / num_th_row_Si;
-        int qk_col = (tx % num_th_row_Si) * chunk_size_Si;
-        int qk_idx = qk_row * Bc + qk_col;
-//        int qk_idx2 = qk_row * Bc * 2 + qk_col * chunk_size_Si;
         float local_row_sum = 0.0f;
 
         if (tx < num_th_row_Si * Br)
         {
             float8 val_f32 = FLOAT8(Si[qk_idx]);
+            float local_row_max = row_max_new;
 
             for (int k = 0; k < 8; ++k)
-                val32 = fmaxf(val32, val_f32[k]);
+                local_row_max = fmaxf(local_row_max, val_f32[k]);
 
             for (int mask = 8; mask > 0; mask >>= 1) 
-                val32 = fmaxf(val32, __shfl_xor(val32, mask, 16));
-//            float row_max = __shfl(val32, 0, 16);
+                local_row_max = fmaxf(local_row_max, __shfl_xor(local_row_max, mask, 16));
 
-            row_max_new = val32;
-
+            row_max_new = local_row_max;
             row_max_new = max(row_max_old, row_max_new);
             //rowmax_diff_exp = exp2f(row_max_old - row_max_new);
             rowmax_diff_exp = expf(row_max_old - row_max_new);
             row_max_old = row_max_new;
 
-//// Si - mi
-//            val_f32 = val_f32 - row_max_new;
-//#pragma unroll // exp but using exp2 instead.
-//            for (int k = 0; k < 8; ++k)
-//                //val_f32[j] = exp2f(val_f32[j]);
-//                val_f32[k] = expf(val_f32[k]);
-
-////#pragma unroll
-//            for (int k = 0; k < 8; ++k) {
-//                local_row_sum += val_f32[k];
-//            }
-//
-//            __syncthreads();
-//            for (int mask = 8; mask > 0; mask >>= 1) {
-//                local_row_sum += __shfl_xor(local_row_sum, mask);
-//            }
-//            __syncthreads();
-//            row_sum = local_row_sum;
-//
-//            FLOAT8(Si[qk_idx]) = val_f32;
-
-        }
-//        __syncthreads();
-
-        if (tx < Br)
-        {
-////// --------------------- find every row max val in Si[Br * Bc]
-//////            float val32 = row_max_new;
-//////#pragma unroll 2
-//////            for (int i = 0; i < Bc; i += 16)
-//////            {
-//////                float_v16 val_f32 = FLOATV16(Si[(tx * Bc) + i]); 
-//////#pragma unroll
-//////                for (int k = 0; k < 16; k++)
-//////                    val32 = max(val32, val_f32[k]); // V_PK_MAX_F16
-//////            }
-////
-//////--------------------Calc Pi = exp(Si - mi) and rowsum 
-#pragma unroll 4
-            for (int i = 0; i < Bc; i += 16)
-            {
-                float_v16 val_f32 = FLOATV16(Si[(tx * Bc) + i]);
 // Si - mi
-                val_f32 = val_f32 - row_max_new;
+            val_f32 = val_f32 - row_max_new;
 #pragma unroll // exp but using exp2 instead.
-                for (int k = 0; k < 16; k++) {
-//                    //val_f32[j] = exp2f(val_f32[j]);
-                    val_f32[k] = expf(val_f32[k]);
-                }
-//
-#pragma unroll // calc rowsum
-                for (int k = 0; k < 16; k++)
-                    row_sum += val_f32[k];
+            for (int k = 0; k < 8; ++k)
+//                //val_f32[j] = exp2f(val_f32[j]);
+                val_f32[k] = expf(val_f32[k]);
 
-                bhalf16 val;
-                val = f32_to_bf16_16(val_f32);
-////#pragma unroll
-////                for (int k = 0; k < 16; k++)
-////                    val[k] = f32_to_bf16(val_f32[k]);
-////////////                bhalf4* val_ptr = reinterpret_cast<bhalf4*>(&val);
-////////////
-////////////                const float* val_f32_raw = reinterpret_cast<const float*>(&val_f32);
-////////////#pragma unroll
-////////////                for (int k = 0; k < 4; k++)
-////////////                    val_ptr[k] = f32_to_bf16_4(*reinterpret_cast<const float_v4*>(&val_f32_raw[k * 4]));
-//////////
-                // write back
-                HALF16((reinterpret_cast<ComputeType*>(Si))[(tx * Bc * 2) + i]) = val;
-            }
+#pragma unroll
+            for (int k = 0; k < 8; ++k)
+                local_row_sum += val_f32[k];
+
+            for (int mask = 8; mask > 0; mask >>= 1)
+                local_row_sum += __shfl_xor(local_row_sum, mask, 16);
+
+            row_sum = local_row_sum;
+
+            bhalf8 val;
+            val = f32_to_bf16_8(val_f32);
+
+            HALF8((reinterpret_cast<ComputeType*>(Si))[qk_idx]) = val;
+
             l_i = rowmax_diff_exp * l_i + row_sum;
-#pragma unroll 4
-            for (int i = 0; i < d; i += 16)
-            {
-                float_v16 val_f32 = FLOATV16(Oi[(tx * d) + i]);
 
-                val_f32 *= rowmax_diff_exp;
+            val_f32 = FLOAT8(Oi[qk_idx]);
 
-                FLOATV16(Oi[(tx * d) + i]) = val_f32;
-            }
-// --------------------- 
+            val_f32 *= rowmax_diff_exp;
+
+            FLOAT8(Oi[qk_idx]) = val_f32;
         }
         __syncthreads();
 
-//        int chunk_size_Oi = 16;
-//        int num_th_row_Oi = d / chunk_size_Oi; // 128 / 16 = 8
-//        int Oi_row = tx / num_th_row_Oi;
-//        int Oi_col = (tx % num_th_row_Oi) * chunk_size_Oi;
-//        int Oi_idx = Oi_row * d + Oi_col;
-//        int vec_idx = Oi_idx / 16;
-//
-//        if (tx < num_th_row_Oi * Br) {
-//            float_v16 val_f32 = Oi_vec[vec_idx];
-//            if (Tr_i == 0 && tx < 16) {
-//                printf("Tc[%d] tx=%d Oi_row=%d, Oi_col=%d, vec_idx=%d, r_maxdiff=%f\n", j, tx, Oi_row, Oi_col, vec_idx, rowmax_diff_exp);
-//            }
-//                        printf("\n");
-//                    }
-//                }
-//            val_f32 *= rowmax_diff_exp;
-//            Oi_vec[vec_idx] = val_f32;
-//
-//            if (tx == 0) {
-//                printf("Oi_vec addr = %p (mod 64 = %lu)\n", Oi_vec, reinterpret_cast<uintptr_t>(Oi_vec) % 64);
-//                printf("rowmax_diff_exp = %f\n", rowmax_diff_exp);
-//                if (vec_idx == 0) {
-//                    for (int i = 0; i < 16; ++i) {
-//                        printf("tx=%d val[%d]=%f\n", tx, i, val_f32[i]);
-//                    }
-//                }
-//            }
-//
-//            val_f32 *= rowmax_diff_exp;
-//            Oi_vec[vec_idx] = val_f32;
-//        }
-//        __syncthreads();
-//
-//        int qk_idx2 = qk_row * num_th_row_Si + tx % num_th_row_Si;
-// 
-//        if (tx < num_th_row_Si * Br)
-//        {
-//            float8 val_f32 = FLOAT8(Si[qk_idx]);
-//            bhalf8 val;
-//            val = f32_to_bf16_8(val_f32);
-//            HALF8((reinterpret_cast<ComputeType*>(Si))[qk_idx2]) = val;
-//#pragma unroll
-//            for (int k = 0; k < 8; k++)
-//                val[k] = f32_to_bf16(val_f32[k]);
-//
-//            reinterpret_cast<bhalf8*>(Si)[qk_idx2] = val;
-//        }
-//        __syncthreads();
-
-
-//        if (tx < Br && tx % 2 == 1)
-//        {
-//            for (int i = 0; i < Bc; i += 16) {
-//                HALF16((reinterpret_cast<ComputeType*>(Si))[(tx * Bc) + i]) = HALF16((reinterpret_cast<ComputeType*>(Si))[(tx * Bc * 2) + i]);
-//            }
-//        }
-//        __syncthreads();
-//            
-//        if (tx < Br && tx % 2 == 0)
-//        {
-//            for (int i = 0; i < Bc; i += 16) {
-//                HALF16((reinterpret_cast<ComputeType*>(Si))[(tx * Bc) + i]) = HALF16((reinterpret_cast<ComputeType*>(Si))[(tx * Bc * 2) + i]);
-//            }
-//        }
-//        __syncthreads();
 
         if constexpr (!pad_mask)
-            mul_add_A_B<N_WAVES>(reinterpret_cast<ComputeType*>(Si), Vj, Oi,   2*Bc,ld_kv,d,   Br, d, Bc);
+            mul_add_A_B<N_WAVES>(reinterpret_cast<ComputeType*>(Si), Vj, Oi,   Bc,ld_kv,d,   Br, d, Bc);
         else
         {
             if (unlikely(xr > nkv))
             {
-                mul_add_A_B_mask_k<N_WAVES>(reinterpret_cast<ComputeType*>(Si), Vj, Oi,   2*Bc,ld_kv,d,  Br, d, Bc, Bc - (xr - nkv));
+                mul_add_A_B_mask_k<N_WAVES>(reinterpret_cast<ComputeType*>(Si), Vj, Oi,   Bc,ld_kv,d,  Br, d, Bc, Bc - (xr - nkv));
             }
             else
             {
-                mul_add_A_B<N_WAVES>(reinterpret_cast<ComputeType*>(Si), Vj, Oi,   2*Bc,ld_kv,d,    Br, d, Bc);
+                mul_add_A_B<N_WAVES>(reinterpret_cast<ComputeType*>(Si), Vj, Oi,   Bc,ld_kv,d,    Br, d, Bc);
             }
         }
 
         __syncthreads();
     }
 
-    if (tx < Br)
+    if (tx < num_th_row_Si * Br)
     {
-// #pragma unroll 32
-//         for (int i = 0; i < d; i++)
-//             Oi[tx * d + i] = Oi[tx * d + i] / l_i;
+        float8 val_f32 = FLOAT8(Oi[qk_idx]);
 
-//------------------------ Calc: Oi /= li  Write back: Oi
-// #pragma unroll 4
-            for (int i = 0; i < d; i += 16)
-            {
-                float_v16 val_f32 = FLOATV16(Oi[(tx * d) + i]);
+        val_f32 = val_f32 / l_i;
 
-                val_f32 = val_f32 / l_i;
-
-                bhalf16 val;
-                val = f32_to_bf16_16(val_f32);
-//#pragma unroll
-//                for (int k = 0; k < 16; k++)
-//                    val.u16x16[k] = f32_to_bf16(val_f32[k]);
-
-//                bhalf4* val_ptr = reinterpret_cast<bhalf4*>(&val);
-//
-//                const float* val_f32_raw = reinterpret_cast<const float*>(&val_f32);
-//#pragma unroll
-//                for (int k = 0; k < 4; k++)
-//                    val_ptr[k] = f32_to_bf16_4(*reinterpret_cast<const float_v4*>(&val_f32_raw[k * 4]));
-
-                //HALF8(Oi[(tx * d) + i]) = val;
-                HALF16((&(o[q_offset + (Tr_i * Br) * ld_q]))[tx * ld_q + i]) = val;
-            }
-
-// #pragma unroll 4
-//         for (int i = 0; i < d; i += 16)
-//             // o[q_offset + Tr_i * Br * d + tx * d + i] = Oi[tx * d + i];
-//             FLOAT8((&(o[q_offset + Tr_i * Br * d]))[tx * d + i]) = FLOAT8(Oi[tx * d + i]);
+        bhalf8 val;
+        val = f32_to_bf16_8(val_f32);
+        HALF8((&(o[q_offset + (Tr_i * Br) * ld_q]))[qk_row * ld_q + qk_col]) = val;
 
         l_i = row_max_old + logf(l_i);
-        //l_i = row_max_old + log2f(l_i);
-        L[L_offset + Tr_i * Br + tx] = l_i;
     }
+
+    if (tx % 16 == 0)
+        L[L_offset + Tr_i * Br + qk_row] = l_i;
 }
 // =================================================================================
 
